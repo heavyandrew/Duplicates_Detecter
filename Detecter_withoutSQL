@@ -1,0 +1,1021 @@
+from google.oauth2 import service_account
+from googleapiclient.http import MediaIoBaseDownload,MediaFileUpload
+import googleapiclient.discovery
+import httplib2
+import apiclient.discovery
+from oauth2client.service_account import ServiceAccountCredentials
+from googleapiclient.discovery import build
+import io
+import os
+import subprocess
+from PIL import Image
+import cv2
+import pandas as pd
+import shutil
+import time
+from pydub.utils import mediainfo
+import psycopg2
+from moviepy.editor import VideoFileClip
+
+spreadsheet_id = '1GsKYZn6ZyqyFbawA4VE_G0doXo193lmurvLjA3u0_fQ'
+SERVICE_ACCOUNT_FILE = 'creds.json' 
+parent = '13LqlEbymYzFRukjUQlzL7y_rCgdixfpu'
+copy_spreadsheet_id = '18qK5BJDW9NKnXK6ddAYz7BvOl3YnumGDQu4mqtONaV0'
+
+step = 3
+
+part_percentage = 85
+one_event_percentage = 14
+
+mod = 0
+
+def get_fps_frameCount(video_path):
+    cam = cv2.VideoCapture(video_path)
+    fps = cam.get(cv2.CAP_PROP_FPS)
+    frameCount = int(cam.get(cv2.CAP_PROP_FRAME_COUNT))
+    if frameCount == 0:
+        frameCount = count_frames_manual(cam)
+    fps = int(fps)
+    return fps, frameCount
+
+def count_frames_manual(video):
+    total = 0
+    while True:
+        (grabbed, frame) = video.read()
+        if not grabbed:
+            break
+        total += 1
+    return total
+
+def ahash(image_path, hash_size):
+    size=(hash_size,hash_size)
+    with open(image_path, 'rb') as f:
+        image = Image.open(f)
+        image = image.convert('L')
+        image = image.resize(size, Image.ANTIALIAS)
+
+    pixel = list(image.getdata())
+    avg = sum(pixel) / len(pixel)
+    bits = "".join(['1' if (px >= avg) else '0' for px in pixel])
+    hashformat = "0{hashlength}x".format(hashlength=hash_size ** 2 // 4)
+    return int(bits, 2).__format__(hashformat)
+
+def cut_video1(video_path, result_path):
+    sel = 'select=not(mod(n\,%d))' % (step)
+    subprocess.call(['ffmpeg', '-i', video_path,
+                    '-vf', sel, '-vsync', 'vfr',
+                     result_path + 'pict%d.jpg'])
+
+def ahash_table1(video_path,result_path,df, video_id, parent):
+    df1 = pd.DataFrame(columns=['Video name','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate', 'Hash'])
+    fps, frameCount = get_fps_frameCount(video_path)
+    name = video_path.rpartition('/')[2]
+    duration = subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                                '-of', 'default=noprint_wrappers=1:nokey=1', video_path])
+    duration = duration.decode('utf-8')
+    if duration == None or duration == 0:
+        duration = VideoFileClip(video_path).duration
+    codec = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                             'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1',
+                             video_path])
+    codec = codec.decode('utf-8')
+    resolution = subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries', 'stream=width,height',
+                                          '-of', 'csv=p=0:s=x', video_path])
+    resolution = resolution.decode('utf-8')
+    num_chan = subprocess.check_output(
+        ['ffprobe', '-i', video_path, '-show_entries', 'stream=channels', '-select_streams', 'a:0', '-of',
+         'compact=p=0:nk=1', '-v', '0'])
+    num_chan = num_chan.decode('utf-8')
+    try:
+        date = mediainfo(video_path)['TAG']['date']
+ 
+    except :
+        try:
+            date = mediainfo(video_path)['TAG']['creation_time']
+        except:
+            date = 0
+    else:
+        try:
+            date1 = mediainfo(video_path)['TAG']['creation_time']
+        except:
+            date = date
+        else:
+            if date1 > date:
+                date = date1
+ 
+    bit_rate = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                             'stream=bit_rate', '-of', 'default=noprint_wrappers=1:nokey=1',
+                             video_path])
+    bit_rate = bit_rate.decode('utf-8')
+    i = 0
+    count = 0
+    hash_size = 8;
+    image_path = result_path + 'pict' + str(i) + '.jpg'
+    df1.loc[count, 'Video name'] = name
+    df1.loc[count, 'Id'] = video_id.rstrip()    
+    df1.loc[count, 'FPS'] = fps
+    df1.loc[count, 'FrameCount'] = frameCount
+    df1.loc[count, 'Codec'] = codec.rstrip()
+    df1.loc[count, 'Duration'] = duration.rstrip()
+    df1.loc[count, 'Resolution'] = resolution.rstrip()
+    df1.loc[count, 'Date'] = date
+    df1.loc[count, 'Bitrate'] = bit_rate.rstrip()
+    parent = parent[2:len(parent) - 2]
+    df1.loc[count, 'Parent'] = parent.rstrip()
+    df1.loc[count, 'Size'] = os.path.getsize(video_path) // (1024)
+    df1.loc[count, 'Num Aud Chan'] = num_chan.rstrip()
+    string = ''
+    while i < frameCount:
+        try:
+            image_path = result_path + 'pict' + str(i) + '.jpg'
+            string = string  + ahash(image_path, hash_size) + ','
+
+            i = i + 1
+        except:
+            i = i+1
+    df1.loc[count, 'Hash'] = string
+    hash_list = string.split(',')
+    del hash_list[len(hash_list) - 1]
+    if len(hash_list)*step/frameCount >= 0.9:
+        df = df.append(df1)     
+    return df
+
+def hashes_are_similar(first_hash, second_hash, tolerance):
+    return hash_distance(first_hash,second_hash) <= tolerance
+
+def hash_distance(first_hash,second_hash):
+    return sum(map(lambda x: 0 if x[0] == x[1] else 1, zip(first_hash, second_hash)))
+
+
+def h_video(df, video_path, video_id, parent):
+    if os.path.exists('res'):
+        shutil.rmtree('res', ignore_errors=False, onerror=None)
+    os.mkdir('res')
+    result = 'res/'
+    cut_video1(video_path,result)
+    df = ahash_table1(video_path, result, df, video_id, parent)
+    shutil.rmtree('res', ignore_errors=False, onerror=None)
+    if len(df.index) !=0:
+        df.dropna(subset=['Hash'], inplace=True)  
+    return  df
+
+def download_file(service, file_id,path):
+    print(path)
+    request = service.files().get_media(fileId=file_id)
+    #filename = 'video' + str(i) + '.avi'
+    fh = io.FileIO(path, 'wb')
+    downloader = MediaIoBaseDownload(fh, request, chunksize = 1024*1024*1024)
+    done = False
+    while done is False:
+        status, done = downloader.next_chunk()
+        print ("Download %d%%." % int(status.progress() * 100))
+ 
+def find_csv(service, name):
+    results_data = service.files().list(pageSize=1000,
+                                   fields="nextPageToken, files(id, name, mimeType, parents)",q="name contains '%s' and mimeType contains 'csv' and '%s' in parents" % (name, parent)).execute()
+    
+    nextPageToken = results_data.get('nextPageToken')
+    
+    while (nextPageToken):
+        nextPage = service.files().list(pageSize=1000,
+                                        fields="nextPageToken, files(id, name, mimeType, parents)",q="name contains '%s' and mimeType contains 'csv' and '%s' in parents" % (name, parent),
+                                        pageToken=nextPageToken).execute()
+        nextPageToken = nextPage.get('nextPageToken')
+        results_data['files'] = results_data['files'] + nextPage['files']
+    return results_data 
+
+def find_video(service):
+    results = service.files().list(pageSize=1000,
+                                       fields="nextPageToken, files(id, name, mimeType, parents)",q="mimeType contains 'video'").execute()
+    nextPageToken = results.get('nextPageToken')
+            
+    while (nextPageToken):
+        nextPage = service.files().list(pageSize=1000,
+                                        fields="nextPageToken, files(id, name, mimeType, parents)",q="mimeType contains 'video'",
+                                        pageToken=nextPageToken).execute()
+        nextPageToken = nextPage.get('nextPageToken')
+        results['files'] = results['files'] + nextPage['files']
+    
+    queue_df = pd.DataFrame(results['files'],columns=['name', 'id','parents'])
+    return queue_df
+
+def find_exact_video(service, name, parent):
+    try:
+        parent = parent[2:len(parent) - 2]
+        results = service.files().list(pageSize=1000,
+                                           fields="nextPageToken, files(id, name, mimeType, parents)",q="name contains '%s' and mimeType contains 'video' and '%s' in parents" % (name, parent)).execute()       
+        nextPageToken = results.get('nextPageToken')
+                
+        while (nextPageToken):
+            nextPage = service.files().list(pageSize=1000,
+                                            fields="nextPageToken, files(id, name, mimeType, parents)",q="name contains '%s' and mimeType contains 'video' and '%s' in parents" % (name, parent),
+                                            pageToken=nextPageToken).execute()
+            nextPageToken = nextPage.get('nextPageToken')
+            results['files'] = results['files'] + nextPage['files']
+        if len(results['files']) != 0:
+            return True
+        else:
+            return False
+    except:
+        return False
+
+def upload_csv(service, name_):
+    csv_list = find_csv(service, name_)
+    delete_csv(service, csv_list)
+    name = name_
+    file_metadata = {
+                    'name': name,
+                    'mimeType': 'text/csv',
+                    'parents': [parent]
+                }
+    media = MediaFileUpload(name_, mimetype = 'text/csv', resumable=True)
+    r = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+ 
+def delete_csv(service, data):
+    for i in range(len(data['files'])):
+        try:
+            service.files().delete(fileId=data.get('files')[i]['id']).execute() 
+        except:
+            pass
+def minor_delete(service, data, number):
+    service.files().delete(fileId=data.get('files')[number]['id']).execute()
+
+def analyzer(SCOPES, service, new_df):
+    existence_number = 1
+    full_duplicate = pd.DataFrame(columns=['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate'])
+    part_duplicate = pd.DataFrame(columns=['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate','start','end', 'Similarity'])
+    compress_duplicate = pd.DataFrame(columns=['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate', 'Degree'])
+    one_event_duplicate = pd.DataFrame(columns=['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate','big_start','big_end', 'small_start','small_end', 'Similarity'])
+    #end = len(df.index) - 1
+    New_hash_1 = new_df.iloc[0][12].split(',')
+    del New_hash_1[len(New_hash_1) - 1]
+    while os.path.exists('Data'+ str(existence_number) +'.csv') == True:
+        data_df = pd.read_csv('Data'+ str(existence_number) +'.csv', delimiter=',')        
+        for i in range(len(data_df.index)):
+            print(new_df.iloc[0][0],'сравниваю c',data_df.iloc[i][0])
+            New_hash_2 = data_df.iloc[i][12].split(',')
+            del New_hash_2[len(New_hash_2) - 1] 
+            if new_df.iloc[0][7] == data_df.iloc[i][7] and new_df.iloc[0][9] == data_df.iloc[i][9]:     
+                print('Одинаковая длина и объем памяти')
+                flag = 0
+                for h in range(100):
+                    frame = int(round((len(New_hash_1) - 1) * h / 100))
+                    if (New_hash_1[frame] == New_hash_2[frame]):
+                        pass
+                    else:
+                        flag = 1
+                if flag == 0:
+                    full_duplicate.loc[len(full_duplicate)] = [new_df.iloc[0][0],new_df.iloc[0][1],new_df.iloc[0][2],new_df.iloc[0][3],new_df.iloc[0][4],new_df.iloc[0][5],\
+                                                               new_df.iloc[0][6],new_df.iloc[0][7],new_df.iloc[0][8],new_df.iloc[0][9],new_df.iloc[0][10],new_df.iloc[0][11],\
+                                                                   data_df.iloc[i][0],data_df.iloc[i][1],data_df.iloc[i][2],data_df.iloc[i][3],data_df.iloc[i][4],data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6],data_df.iloc[i][7],data_df.iloc[i][8],data_df.iloc[i][9],data_df.iloc[i][10],data_df.iloc[i][11]]
+            elif new_df.iloc[0][7] == data_df.iloc[i][7]:
+                print('Только одинаковая длина')
+                flag = 0
+                for h in range(100):
+                    frame = int(round((len(New_hash_1) - 1) * h / 100))
+                    if (hashes_are_similar(New_hash_1[frame], New_hash_2[frame], 3)):
+                        pass
+                    else:
+                        flag = 1
+                if flag == 0:
+                    if new_df.iloc[0][9] > data_df.iloc[i][9]:
+                        compress_duplicate.loc[len(compress_duplicate)] = [new_df.iloc[0][0],new_df.iloc[0][1],new_df.iloc[0][2],new_df.iloc[0][3],new_df.iloc[0][4],new_df.iloc[0][5],\
+                                                               new_df.iloc[0][6],new_df.iloc[0][7],new_df.iloc[0][8],new_df.iloc[0][9],new_df.iloc[0][10],new_df.iloc[0][11],\
+                                                                   data_df.iloc[i][0],data_df.iloc[i][1],data_df.iloc[i][2],data_df.iloc[i][3],data_df.iloc[i][4],data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6],data_df.iloc[i][7],data_df.iloc[i][8],data_df.iloc[i][9],data_df.iloc[i][10],data_df.iloc[i][11],round(int(round(float(data_df.iloc[i][9])))/int(round(float(new_df.iloc[0][9])))*100, 3)]
+                        
+                    else:
+                        compress_duplicate.loc[len(compress_duplicate)] = [data_df.iloc[i][0],data_df.iloc[i][1],data_df.iloc[i][2],data_df.iloc[i][3],data_df.iloc[i][4],data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6],data_df.iloc[i][7],data_df.iloc[i][8],data_df.iloc[i][9],data_df.iloc[i][10],data_df.iloc[i][11],\
+                                                                   new_df.iloc[0][0],new_df.iloc[0][1],new_df.iloc[0][2],new_df.iloc[0][3],new_df.iloc[0][4],new_df.iloc[0][5],\
+                                                               new_df.iloc[0][6],new_df.iloc[0][7],new_df.iloc[0][8],new_df.iloc[0][9],new_df.iloc[0][10],new_df.iloc[0][11],round(int(round(float(new_df.iloc[0][9])))/int(round(float(data_df.iloc[i][9])))*100, 3)]
+            elif new_df.iloc[0][7] != data_df.iloc[i][7]:
+                print('Неодинаковая длина')
+                big_is_first = False
+                if len(New_hash_1) > len(New_hash_2):
+                    big_one = New_hash_1
+                    small_one = New_hash_2
+                    big_is_first = True
+                else:
+                    small_one = New_hash_1
+                    big_one = New_hash_2
+                
+                big_count = 0
+                k = 0
+                while k < len(small_one):
+                    s = 0       
+                    while s < (len(big_one) - len(small_one)):
+ 
+                        if hashes_are_similar(big_one[s], small_one[k], 6):
+                            check_count = 3
+                            count = 3
+                            flag = 0
+                            plus = 3
+ 
+                            while flag == 0 and len(small_one) > (k + plus):
+                                if len(big_one) - (s+plus) > 3 and len(small_one) - (k+plus) > 3:
+                                    if hashes_are_similar(big_one[s+plus], small_one[k+plus], 6) and hashes_are_similar(big_one[s + plus + 1], small_one[k + plus + 1], 6) and hashes_are_similar(big_one[s + plus + 2], small_one[k + plus + 2], 6):
+                                        count = count + (6 - hash_distance(big_one[s + plus], small_one[k+plus]))/6 + (6 - hash_distance(big_one[s+plus + 1], small_one[k + plus + 1]))/6 + (6 - hash_distance(big_one[s + plus + 2], small_one[k + plus + 2]))/6
+                                        plus = plus + 3
+                                        check_count = check_count + 3
+                                    else: 
+                                        flag = 1
+                                else:
+                                    if hashes_are_similar(big_one[s+plus], small_one[k+plus], 6):        
+                                        count = count + (6 - hash_distance(big_one[s + plus], small_one[k+plus]))/2
+                                        check_count = check_count + 3
+                                        plus = plus + 3
+                                    else: 
+                                        flag = 1                                  
+                            if count > big_count:
+                                big_count = count 
+                                momentB = s
+                                momentS = k
+                            s = s + check_count
+                        else:
+                            s = s + 3
+                    k = k + 3
+                
+                if big_count/len(small_one) >= part_percentage/100:
+                    print('Сходство на ', big_count/len(small_one),'как часть целое')
+                    if big_is_first == True:
+                        part_duplicate.loc[len(part_duplicate)] = [new_df.iloc[0][0],new_df.iloc[0][1],new_df.iloc[0][2],new_df.iloc[0][3],new_df.iloc[0][4],new_df.iloc[0][5],\
+                                                               new_df.iloc[0][6],new_df.iloc[0][7],new_df.iloc[0][8],new_df.iloc[0][9],new_df.iloc[0][10],new_df.iloc[0][11],\
+                                                                   data_df.iloc[i][0],data_df.iloc[i][1],data_df.iloc[i][2],data_df.iloc[i][3],data_df.iloc[i][4],data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6],data_df.iloc[i][7],data_df.iloc[i][8],data_df.iloc[i][9],data_df.iloc[i][10],data_df.iloc[i][11],\
+                                                                   round(float(new_df.iloc[0][3])*momentS/len(big_one), 3), round(float(new_df.iloc[0][3])*momentS/ len(big_one) + float(data_df.iloc[i][3]), 3), min(round(big_count/len(small_one), 3)*100, 100)]
+                    else:
+                        part_duplicate.loc[len(part_duplicate)] = [data_df.iloc[i][0],data_df.iloc[i][1],data_df.iloc[i][2],data_df.iloc[i][3],data_df.iloc[i][4],data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6],data_df.iloc[i][7],data_df.iloc[i][8],data_df.iloc[i][9],data_df.iloc[i][10],data_df.iloc[i][11],\
+                                                                   new_df.iloc[0][0],new_df.iloc[0][1],new_df.iloc[0][2],new_df.iloc[0][3],new_df.iloc[0][4],new_df.iloc[0][5],\
+                                                               new_df.iloc[0][6],new_df.iloc[0][7],new_df.iloc[0][8],new_df.iloc[0][9],new_df.iloc[0][10],new_df.iloc[0][11],\
+                                                                   round(float(data_df.iloc[i][3])*momentS/len(big_one), 3), round(float(data_df.iloc[i][3])*momentS/len(big_one) + float(new_df.iloc[0][3]), 3), min(round(big_count/len(small_one), 3)*100, 100)]
+                elif big_count/(len(small_one)*3) >= one_event_percentage/100:
+                        print('Сходство на ', big_count/(len(small_one)*3),'как одно событие')
+                        if big_is_first == True:
+                            one_event_duplicate.loc[len(one_event_duplicate)] = [new_df.iloc[0][0],new_df.iloc[0][1],new_df.iloc[0][2],new_df.iloc[0][3],new_df.iloc[0][4],new_df.iloc[0][5],\
+                                                                   new_df.iloc[0][6],new_df.iloc[0][7],new_df.iloc[0][8],new_df.iloc[0][9],new_df.iloc[0][10],new_df.iloc[0][11],\
+                                                                       data_df.iloc[i][0],data_df.iloc[i][1],data_df.iloc[i][2],data_df.iloc[i][3],data_df.iloc[i][4],data_df.iloc[i][5],\
+                                                                   data_df.iloc[i][6],data_df.iloc[i][7],data_df.iloc[i][8],data_df.iloc[i][9],data_df.iloc[i][10],data_df.iloc[i][11],\
+                                                                       round(float(new_df.iloc[0][3])*momentB/len(big_one), 3), round(float(new_df.iloc[0][3])*momentB/ len(big_one) + big_count*float(new_df.iloc[0][3])/float(new_df.iloc[0][7]), 3),\
+                                                                       round(float(data_df.iloc[i][3])*momentS/len(small_one), 3), round(float(data_df.iloc[i][3])*momentS/ len(small_one) + big_count*float(data_df.iloc[i][3])/float(data_df.iloc[i][7]), 3), min(round(big_count/(len(small_one)*3), 3)*100, 100)]
+                        else:
+                            one_event_duplicate.loc[len(one_event_duplicate)] = [data_df.iloc[i][0],data_df.iloc[i][1],data_df.iloc[i][2],data_df.iloc[i][3],data_df.iloc[i][4],data_df.iloc[i][5],\
+                                                                   data_df.iloc[i][6],data_df.iloc[i][7],data_df.iloc[i][8],data_df.iloc[i][9],data_df.iloc[i][10],data_df.iloc[i][11],\
+                                                                       new_df.iloc[0][0],new_df.iloc[0][1],new_df.iloc[0][2],new_df.iloc[0][3],new_df.iloc[0][4],new_df.iloc[0][5],\
+                                                                   new_df.iloc[0][6],new_df.iloc[0][7],new_df.iloc[0][8],new_df.iloc[0][9],new_df.iloc[0][10],new_df.iloc[0][11],\
+                                                                       round(float(data_df.iloc[i][3])*momentB/len(big_one), 3), round(float(data_df.iloc[i][3])*momentB/len(big_one) + big_count*float(data_df.iloc[i][3])/float(data_df.iloc[i][7]), 3),\
+                                                                       round(float(new_df.iloc[0][3])*momentS/len(big_one), 3), round(float(new_df.iloc[0][3])*momentS/ len(big_one) + big_count*float(new_df.iloc[0][3])/float(new_df.iloc[0][7]), 3), min(round(big_count/(len(small_one)*3), 3)*100, 100)]
+        existence_number = existence_number + 1 
+    upload_results(service, full_duplicate,'full_duplicate_database.csv')
+    upload_results(service, part_duplicate,'part_duplicate_database.csv')
+    upload_results(service, compress_duplicate,'compress_duplicate_database.csv')
+    upload_results(service, one_event_duplicate,'one_event_duplicate_database.csv')
+
+    credentials = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
+    httpAuth = credentials.authorize(httplib2.Http())
+    service = apiclient.discovery.build('sheets','v4', http = httpAuth)
+    
+    body ={"valueInputOption": "USER_ENTERED",
+       "data":[]
+       }
+    
+    values = service.spreadsheets().values().get(spreadsheetId = spreadsheet_id, range = 'Полные!A:A',
+    majorDimension = 'COLUMNS').execute()
+    #pp.pprint(values)
+    try:
+        length = len(values['values'][0])
+    except:
+        length = 0
+    if length == 0:
+        body['data'].append({"range":'Полные!1:1',
+           "majorDimension": "ROWS",
+           "values":[['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate']]})
+        start = 2
+    else: 
+        start = length + 1
+    if len(full_duplicate.index) != 0:
+        for i in range(len(full_duplicate.index)):
+            body['data'].append({"range":'Полные!%d:%d' % (start + i, start + i),
+               "majorDimension": "ROWS",
+               "values":[[full_duplicate.iloc[i][0],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + full_duplicate.iloc[i][1] + '/view?usp=sharing', full_duplicate.iloc[i][1]),\
+                          '=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + full_duplicate.iloc[i][2] + '?usp=sharing', full_duplicate.iloc[i][2]),str(full_duplicate.iloc[i][3]),full_duplicate.iloc[i][4],\
+                              full_duplicate.iloc[i][5], str(full_duplicate.iloc[i][6]), str(full_duplicate.iloc[i][7]),str(full_duplicate.iloc[i][8]),str(full_duplicate.iloc[i][9]),str(full_duplicate.iloc[i][10]),str(full_duplicate.iloc[i][11]),full_duplicate.iloc[i][12],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + full_duplicate.iloc[i][13] + '/view?usp=sharing', full_duplicate.iloc[i][13]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + full_duplicate.iloc[i][14] + '?usp=sharing', full_duplicate.iloc[i][14]),str(full_duplicate.iloc[i][15]),full_duplicate.iloc[i][16], full_duplicate.iloc[i][17], str(full_duplicate.iloc[i][18]), str(full_duplicate.iloc[i][19]),str(full_duplicate.iloc[i][20]),str(full_duplicate.iloc[i][21]),str(full_duplicate.iloc[i][22]),str(full_duplicate.iloc[i][23])]]
+               })
+                
+    values = service.spreadsheets().values().get(spreadsheetId = spreadsheet_id, range = 'Сжатые!A:A',
+    majorDimension = 'COLUMNS').execute()            
+    try:
+        length = len(values['values'][0])
+    except:
+        length = 0
+    if length == 0:
+        body['data'].append({"range":'Сжатые!1:1',
+           "majorDimension": "ROWS",
+           "values":[['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate','Degree']]})
+        start = 2
+    else: 
+        start = length + 1
+    if len(compress_duplicate.index) != 0:
+        for i in range(len(compress_duplicate.index)):
+            body['data'].append({"range":'Сжатые!%d:%d' % (start + i, start + i),
+               "majorDimension": "ROWS",
+               "values":[[compress_duplicate.iloc[i][0],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + compress_duplicate.iloc[i][1] + '/view?usp=sharing', compress_duplicate.iloc[i][1]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + compress_duplicate.iloc[i][2] + '?usp=sharing', compress_duplicate.iloc[i][2]),str(compress_duplicate.iloc[i][3]),compress_duplicate.iloc[i][4], compress_duplicate.iloc[i][5], str(compress_duplicate.iloc[i][6]), str(compress_duplicate.iloc[i][7]),str(compress_duplicate.iloc[i][8]),str(compress_duplicate.iloc[i][9]),str(compress_duplicate.iloc[i][10]),str(compress_duplicate.iloc[i][11]),compress_duplicate.iloc[i][12],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + compress_duplicate.iloc[i][13] + '/view?usp=sharing', compress_duplicate.iloc[i][13]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + compress_duplicate.iloc[i][14] + '?usp=sharing', compress_duplicate.iloc[i][14]),str(compress_duplicate.iloc[i][15]),compress_duplicate.iloc[i][16], compress_duplicate.iloc[i][17], str(compress_duplicate.iloc[i][18]), str(compress_duplicate.iloc[i][19]),str(compress_duplicate.iloc[i][20]),str(compress_duplicate.iloc[i][21]),str(compress_duplicate.iloc[i][22]),str(compress_duplicate.iloc[i][23]), str(compress_duplicate.iloc[i][24])]]
+               })
+    
+    values = service.spreadsheets().values().get(spreadsheetId = spreadsheet_id, range = 'Частичные!A:A',
+    majorDimension = 'COLUMNS').execute()
+    try:
+        length = len(values['values'][0])
+    except:
+        length = 0
+    if length == 0:
+        body['data'].append({"range":'Частичные!1:1',
+           "majorDimension": "ROWS",
+           "values":[['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate','S time in big','E time in big', 'Similarity']]})
+        start = 2
+    else: 
+        start = length + 1
+    if len(part_duplicate.index) != 0:
+        for i in range(len(part_duplicate.index)):
+            body['data'].append({"range":'Частичные!%d:%d' % (start + i, start + i),
+               "majorDimension": "ROWS",
+               "values":[[part_duplicate.iloc[i][0],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + part_duplicate.iloc[i][1] + '/view?usp=sharing', part_duplicate.iloc[i][1]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + part_duplicate.iloc[i][2] + '?usp=sharing', part_duplicate.iloc[i][2]),str(part_duplicate.iloc[i][3]),part_duplicate.iloc[i][4], part_duplicate.iloc[i][5], str(part_duplicate.iloc[i][6]), str(part_duplicate.iloc[i][7]),str(part_duplicate.iloc[i][8]),str(part_duplicate.iloc[i][9]),str(part_duplicate.iloc[i][10]),str(part_duplicate.iloc[i][11]),part_duplicate.iloc[i][12],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + part_duplicate.iloc[i][13] + '/view?usp=sharing', part_duplicate.iloc[i][13]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + part_duplicate.iloc[i][14] + '?usp=sharing', part_duplicate.iloc[i][14]),str(part_duplicate.iloc[i][15]),part_duplicate.iloc[i][16], part_duplicate.iloc[i][17], str(part_duplicate.iloc[i][18]), str(part_duplicate.iloc[i][19]),str(part_duplicate.iloc[i][20]),str(part_duplicate.iloc[i][21]),str(part_duplicate.iloc[i][22]),str(part_duplicate.iloc[i][23]),str(part_duplicate.iloc[i][24]),str(part_duplicate.iloc[i][25]),str(part_duplicate.iloc[i][26])]]
+               })
+            
+    values = service.spreadsheets().values().get(spreadsheetId = spreadsheet_id, range = 'Одно событие!A:A',
+    majorDimension = 'COLUMNS').execute()
+    try:
+        length = len(values['values'][0])
+    except:
+        length = 0
+    if length == 0:
+        body['data'].append({"range":'Одно событие!1:1',
+           "majorDimension": "ROWS",
+           "values":[['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate','S time in big','E time in big','S time in small','E time in small', 'Similarity']]})
+        start = 2
+    else: 
+        start = length + 1
+    if len(one_event_duplicate.index) != 0:
+        for i in range(len(one_event_duplicate.index)):
+            body['data'].append({"range":'Одно событие!%d:%d' % (start + i, start + i),
+               "majorDimension": "ROWS",
+               "values":[[one_event_duplicate.iloc[i][0],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + one_event_duplicate.iloc[i][1] + '/view?usp=sharing', one_event_duplicate.iloc[i][1]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + one_event_duplicate.iloc[i][2] + '?usp=sharing', one_event_duplicate.iloc[i][2]),str(one_event_duplicate.iloc[i][3]),one_event_duplicate.iloc[i][4], one_event_duplicate.iloc[i][5], str(one_event_duplicate.iloc[i][6]), str(one_event_duplicate.iloc[i][7]),str(one_event_duplicate.iloc[i][8]),str(one_event_duplicate.iloc[i][9]),str(one_event_duplicate.iloc[i][10]),str(one_event_duplicate.iloc[i][11]),one_event_duplicate.iloc[i][12],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + one_event_duplicate.iloc[i][13] + '/view?usp=sharing', one_event_duplicate.iloc[i][13]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + one_event_duplicate.iloc[i][14] + '?usp=sharing', one_event_duplicate.iloc[i][14]),str(one_event_duplicate.iloc[i][15]),one_event_duplicate.iloc[i][16], one_event_duplicate.iloc[i][17], str(one_event_duplicate.iloc[i][18]), str(one_event_duplicate.iloc[i][19]),str(one_event_duplicate.iloc[i][20]),str(one_event_duplicate.iloc[i][21]),str(one_event_duplicate.iloc[i][22]),str(one_event_duplicate.iloc[i][23]),str(one_event_duplicate.iloc[i][24]),str(one_event_duplicate.iloc[i][25]),str(one_event_duplicate.iloc[i][26]),str(one_event_duplicate.iloc[i][27]), str(one_event_duplicate.iloc[i][28])]]
+               })
+            
+    values = service.spreadsheets().values().batchUpdate(
+    spreadsheetId = spreadsheet_id, body = body).execute()      
+      
+                
+def upload_results(service, data, name):
+    if len(data.index) != 0:
+        if os.path.exists(name) == True:
+            data_df = pd.read_csv(name, delimiter=',')
+            data_df = pd.concat([data_df, data], ignore_index = True)
+        else:
+           data_df = data
+        data_df.to_csv(name, index=False, encoding='utf-8')
+        upload_csv(service, name)  
+            
+
+def check_database(service, search, name, queue_df):
+    if os.path.exists(search):
+        data_df = pd.read_csv(name, delimiter=',')
+        length = len(data_df.index)
+        data_df = data_df.loc[data_df['Id'].isin(queue_df['id'].tolist())]
+        data_df = data_df.loc[data_df['D_Id'].isin(queue_df['id'].tolist())]
+        if length != len(data_df.index):
+            data_list = find_csv(service, search)
+            delete_csv(service, data_list)
+            data_df.to_csv(name, index=False, encoding='utf-8')
+            upload_csv(service, name)
+
+
+def error_deleted_to_sheets(SCOPES, sheet, df):
+    credentials = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
+    httpAuth = credentials.authorize(httplib2.Http())
+    service = apiclient.discovery.build('sheets','v4', http = httpAuth)
+    
+    body ={"valueInputOption": "USER_ENTERED",
+       "data":[]
+       }
+    
+    values = service.spreadsheets().values().get(spreadsheetId = spreadsheet_id, range = '%s!A:A'%(sheet),
+    majorDimension = 'COLUMNS').execute()
+    #pp.pprint(values)
+    try:
+        length = len(values['values'][0])
+    except:
+        length = 0
+    if length == 0:
+        body['data'].append({"range":'%s!1:1'%(sheet),
+           "majorDimension": "ROWS",
+           "values":[['Original','Id','Parent']]})
+        start = 2
+    else: 
+        start = length + 1
+    if len(df.index) != 0:
+        for i in range(len(df.index)):
+            body['data'].append({"range":'%s!%d:%d' % (sheet, start + i, start + i),
+               "majorDimension": "ROWS",
+               "values":[[df.iloc[i][0],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + df.iloc[i][1] + '/view?usp=sharing', df.iloc[i][1]),\
+                          '=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + df.iloc[i][2] + '?usp=sharing', df.iloc[i][2])]]
+               })
+    values = service.spreadsheets().values().batchUpdate(
+    spreadsheetId = spreadsheet_id, body = body).execute() 
+    
+def delete_from_sheets(SCOPES, to_delete_df):
+    credentials = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
+    httpAuth = credentials.authorize(httplib2.Http())
+    service = apiclient.discovery.build('sheets','v4', http = httpAuth)
+    
+    for sheet_name in ['Полные', 'Сжатые','Частичные', 'Одно событие', 'Поврежденные', 'Удаленные']:
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheets = sheet_metadata.get('sheets', '')
+        number = 0
+        while sheets[number].get("properties", {}).get("title", "Sheet1") != sheet_name:
+            number = number + 1
+        for column in ['B', 'N']:
+            if column == 'N' and (sheet_name == 'Поврежденные' or sheet_name == 'Удаленные'):
+                pass
+            else:
+                values = service.spreadsheets().values().get(spreadsheetId = spreadsheet_id, range = '%s!%s:%s'%(sheet_name, column, column),
+                                                             majorDimension = 'COLUMNS').execute()
+                try:
+                    sheets_df = pd.DataFrame(pd.DataFrame.from_dict(values).iloc[0][2], columns = ['id'])
+                    
+                    delete_index = sheets_df.loc[sheets_df['id'].isin(to_delete_df['id'].tolist())].index
+                    
+                    for i in reversed(delete_index):
+                        request_body = {
+                            'requests':[
+                                {'deleteDimension':{
+                                    'range':{
+                                        'sheetId': sheets[number].get("properties", {}).get("sheetId", 0),
+                                        'dimension':'ROWS',
+                                        'startIndex': int(i),
+                                        'endIndex': int(i) + 1
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                        result = service.spreadsheets().batchUpdate(spreadsheetId = spreadsheet_id, body = request_body).execute()
+                except ValueError:
+                    pass
+                
+def little_error_delete_dowload(service, SCOPES, downloaded_df, search, sheet):
+    little_exception_list = find_csv(service, search)
+    if len(little_exception_list['files']) != 0: 
+        for i in range(len(little_exception_list['files'])):
+            download_file(service, little_exception_list.get('files')[i]['id'],"%s.csv" % search)
+            error_df = pd.read_csv("%s.csv" % search, delimiter=',')
+            error_df = error_df.loc[~error_df['id'].isin(downloaded_df['id'].tolist())]
+            if len(error_df.index) != 0:
+                error_to_sheets_df = pd.DataFrame(columns=['name', 'id','parents'])
+                error_to_sheets_df.loc[len(error_to_sheets_df.index)] = [error_df.iloc[0][0], error_df.iloc[0][1], error_df.iloc[0][2]]                                                                   
+                error_deleted_to_sheets(SCOPES, sheet, error_to_sheets_df)
+                downloaded_df.loc[len(downloaded_df.index)] = [error_df.iloc[0][0], error_df.iloc[0][1], error_df.iloc[0][2][2:len(error_df.iloc[0][2]) - 2], error_df.iloc[0][3], error_df.iloc[0][4], error_df.iloc[0][5]]
+                minor_delete(service, little_exception_list, i)
+                if os.path.exists("%s.csv" % search): 
+                    os.remove("%s.csv" % search)
+    return downloaded_df
+
+def minor_data_download(service, SCOPES, downloaded_df):
+    minor_data_list = find_csv(service, 'minor_data')
+    if len(minor_data_list['files']) != 0: 
+        for i in range(len(minor_data_list['files'])):
+            download_file(service, minor_data_list.get('files')[i]['id'],"minor_data.csv")
+            new_data_df = pd.read_csv("minor_data.csv", delimiter=',')
+            minor_delete(service, minor_data_list, i)
+            new_data_df = new_data_df.loc[~new_data_df['Id'].isin(downloaded_df['id'].tolist())]
+            if len(new_data_df.index) != 0:
+                to_data_df = pd.DataFrame(columns=['Video name','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate', 'Hash'])
+                downloaded_df.loc[len(downloaded_df.index)] = [new_data_df.loc[0][0], new_data_df.iloc[0][1], new_data_df.iloc[0][2], 'Not corrupted', new_data_df.iloc[0][13], new_data_df.iloc[0][14]]
+                to_data_df.loc[len(to_data_df.index)] = [new_data_df.loc[0][0], new_data_df.iloc[0][1], new_data_df.iloc[0][2], new_data_df.iloc[0][3], new_data_df.iloc[0][4], new_data_df.iloc[0][5], new_data_df.iloc[0][6], new_data_df.iloc[0][7], new_data_df.iloc[0][8], new_data_df.iloc[0][9], new_data_df.iloc[0][10], new_data_df.iloc[0][11], new_data_df.iloc[0][12]]
+                
+                analyzer(SCOPES, to_data_df)
+                
+                existence_number = 1                
+                while os.path.exists('Data'+ str(existence_number) +'.csv') == True:
+                    existence_number = existence_number + 1                
+                if existence_number != 1:
+                    data_df = pd.read_csv("Data" + str(existence_number - 1) + ".csv", delimiter=',')
+                    if len(data_df.index)< 10000:
+                        data_df = pd.concat([data_df, to_data_df], ignore_index = True)
+                        data_df.to_csv("Data" + str(existence_number - 1) + ".csv", index=False, encoding='utf-8')
+                    else:
+                        data_df = to_data_df
+                        data_df.to_csv("Data" + str(existence_number) + ".csv", index=False, encoding='utf-8')
+                else:
+                    data_df = to_data_df
+                    data_df.to_csv("Data" + str(existence_number) + ".csv", index=False, encoding='utf-8')
+    if os.path.exists("minor_data.csv"): 
+        os.remove("minor_data.csv")
+    return downloaded_df   
+
+def main():
+    print('Новая итерация')
+    SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    
+    credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    service = build('drive', 'v3', credentials=credentials)
+    if os.path.exists('queue.csv') == False:
+        print('Нет очереди') 
+        queue_df = find_video(service)
+        if os.path.exists('dowloaded.csv') == False:
+            print('Нет загруженных видео') 
+            queue_df.to_csv('queue.csv', index=False, encoding='utf-8')
+            upload_csv(service,'queue.csv')
+        else:
+            print('Есть загруженные видео')
+            downloaded_df = pd.read_csv('dowloaded.csv', delimiter=',')
+            queue_df = queue_df.loc[~queue_df['id'].isin(downloaded_df['id'].tolist())]                    
+            queue_df.sort_values(by=['name'])
+            queue_df.to_csv('queue.csv', index=False, encoding='utf-8')
+            upload_csv(service, 'queue.csv')
+    else:
+        queue_df = pd.read_csv('queue.csv', delimiter=',')
+        if len(queue_df.index) != 0:
+            if find_exact_video(service, queue_df.iloc[0][0], queue_df.iloc[0][2]):
+                flag = False
+                while flag == False:
+                    try:
+                        print('Файл', queue_df.iloc[0][0],'присутствует')
+                        start = time.time()
+                        download_file(service, queue_df.iloc[0][1],queue_df.iloc[0][0])
+                        dl_time = int(round(float('%s' % (time.time() - start))))
+                        flag = True
+                        if os.path.getsize(queue_df.iloc[0][0]) == 0:
+                            if os.path.exists(queue_df.iloc[0][0]):
+                                os.remove(queue_df.iloc[0][0])
+                            print('Файл', queue_df.iloc[0][0],'удален')    
+                            deleted_df = pd.DataFrame(columns=['name', 'id','parents'])
+                            deleted_df.loc[0] = queue_df.iloc[0]
+                            deleted_df.iloc[0][2] = deleted_df.iloc[0][2][2:len(deleted_df.iloc[0][2]) - 2]
+                            error_deleted_to_sheets(SCOPES, 'Удаленные', deleted_df)
+                            if os.path.exists('dowloaded.csv') == True:
+                                downloaded_df = pd.read_csv('dowloaded.csv', delimiter=',')
+                                deleted_df = deleted_df.loc[~deleted_df['id'].isin(downloaded_df['id'].tolist())]
+                            else:
+                                downloaded_df = pd.DataFrame(columns=['name', 'id','parents', 'status','dl_time', 'tf_time'])
+                    
+                            if len(deleted_df.index) != 0:
+                                downloaded_df.loc[len(downloaded_df.index)] = [deleted_df.iloc[0][0], deleted_df.iloc[0][1], deleted_df.iloc[0][2], 'Deleted',dl_time, 0]
+                    
+                            downloaded_df = little_error_delete_dowload(service, SCOPES, downloaded_df, 'little_error', 'Поврежденные')
+                            downloaded_df = little_error_delete_dowload(service, SCOPES, downloaded_df, 'little_deleted', 'Удаленные')
+                            downloaded_df = minor_data_download(service, SCOPES, downloaded_df)
+                    
+                            queue_df = queue_df.loc[~queue_df['id'].isin(downloaded_df['id'].tolist())]
+                            queue_df.to_csv('queue.csv', index=False, encoding='utf-8')
+                            downloaded_df.sort_values(by=['name'])
+                            downloaded_df.to_csv('dowloaded.csv', index=False, encoding='utf-8')
+                            upload_csv(service, 'dowloaded.csv')
+                            upload_csv(service, 'queue.csv')
+                        else:
+                            new_data_df = pd.DataFrame(columns=['Video name', 'Id', 'Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate', 'Hash'])
+                            start = time.time()
+                            new_data_df = h_video(new_data_df, queue_df.iloc[0][0], queue_df.iloc[0][1], queue_df.iloc[0][2])
+                            tf_time = int(round(float('%s' % (time.time() - start))))
+                            if os.path.exists(queue_df.iloc[0][0]): 
+                                os.remove(queue_df.iloc[0][0]) 
+                            if os.path.exists('dowloaded.csv') == True:
+                                downloaded_df = pd.read_csv('dowloaded.csv', delimiter=',')
+                            else:
+                                downloaded_df = pd.DataFrame(columns=['name', 'id','parents', 'status','dl_time', 'tf_time'])
+                            if len(new_data_df.index) != 0:
+                        
+                                analyzer(SCOPES, service, new_data_df)
+                    
+                                existence_number = 1                
+                                while os.path.exists('Data'+ str(existence_number) +'.csv') == True:
+                                    existence_number = existence_number + 1                
+                                if existence_number != 1:
+                                    data_df = pd.read_csv("Data" + str(existence_number - 1) + ".csv", delimiter=',')
+                                    if len(data_df.index)< 10000:
+                                        data_df = pd.concat([data_df, new_data_df], ignore_index = True)
+                                        data_df.to_csv("Data" + str(existence_number - 1) + ".csv", index=False, encoding='utf-8')
+                                    else:
+                                        data_df = new_data_df
+                                        data_df.to_csv("Data" + str(existence_number) + ".csv", index=False, encoding='utf-8')
+                                else:
+                                    data_df = new_data_df
+                                    data_df.to_csv("Data" + str(existence_number) + ".csv", index=False, encoding='utf-8')
+                        
+                                downloaded_df.loc[len(downloaded_df.index)] = [new_data_df.iloc[0][0], new_data_df.iloc[0][1], new_data_df.iloc[0][2], 'Not corrupted', dl_time, tf_time]
+                            else:
+                                print('Файл', queue_df.iloc[0][0],'поврежден')  
+                                error_df = pd.DataFrame(columns=['name', 'id','parents'])
+                                error_df.loc[0] = queue_df.iloc[0]
+                                error_df.iloc[0][2] = error_df.iloc[0][2][2:len(error_df.iloc[0][2]) - 2]
+                                error_deleted_to_sheets(SCOPES, 'Поврежденные', error_df)
+                                downloaded_df.loc[len(downloaded_df.index)] = [error_df.iloc[0][0], error_df.iloc[0][1], error_df.iloc[0][2], 'Сorrupted', dl_time, tf_time]
+                    
+                            downloaded_df = little_error_delete_dowload(service, SCOPES, downloaded_df, 'little_error', 'Поврежденные')
+                            downloaded_df = little_error_delete_dowload(service, SCOPES, downloaded_df, 'little_deleted', 'Удаленные')
+                            downloaded_df = minor_data_download(service, SCOPES, downloaded_df)
+                    
+                            queue_df = queue_df.loc[~queue_df['id'].isin(downloaded_df['id'].tolist())]
+                            downloaded_df.sort_values(by=['name'])
+                            downloaded_df.to_csv('dowloaded.csv', index=False, encoding='utf-8')
+                            upload_csv(service, 'dowloaded.csv')
+                            queue_df.to_csv('queue.csv', index=False, encoding='utf-8') 
+                            upload_csv(service, 'queue.csv')
+                    except OSError:
+                        print('Файл', queue_df.iloc[0][0],'весит слишком много')
+                        flag = False
+                        if os.path.exists(queue_df.iloc[0][0]):
+                            os.remove(queue_df.iloc[0][0])
+                        queue_df = queue_df.iloc[1:]
+            else:
+                print('Файл', queue_df.iloc[0][0],'отсутствует')
+                queue_df = find_video(service)
+                for search in ['full_duplicate_database.csv', 'part_duplicate_database.csv', 'compress_duplicate_database.csv', 'one_event_duplicate_database.csv']:
+                    check_database(service, search, search, queue_df)
+                if os.path.exists('dowloaded.csv') == True:
+                    downloaded_df = pd.read_csv('dowloaded.csv', delimiter=',')
+                    past_dowloaded_length = len(downloaded_df.index)
+                    
+                    to_delete_df = downloaded_df.loc[~downloaded_df['id'].isin(queue_df['id'].tolist())] 
+                    delete_from_sheets(SCOPES, to_delete_df)
+                    
+                    downloaded_df = downloaded_df.loc[downloaded_df['id'].isin(queue_df['id'].tolist())]  
+                    queue_df = queue_df.loc[~queue_df['id'].isin(downloaded_df['id'].tolist())]
+                    if len(downloaded_df.index) != past_dowloaded_length:
+                        existence_number = 1                
+                        while os.path.exists('Data'+ str(existence_number) +'.csv') == True:
+                            data_df = pd.read_csv("Data" + str(existence_number) + ".csv", delimiter=',')
+                            data_df = data_df.loc[data_df['Id'].isin(queue_df['id'].tolist())]
+                            data_df.to_csv('Data'+ str(existence_number) +'.csv', index=False, encoding='utf-8')
+                            existence_number = existence_number + 1
+                        downloaded_df.to_csv('dowloaded.csv', index=False, encoding='utf-8')
+                        upload_csv(service, 'dowloaded.csv')
+
+                queue_df.to_csv('queue.csv', index=False, encoding='utf-8')    
+                upload_csv(service, 'queue.csv') 
+        else:
+            print('Нечего загружать')
+            queue_df = find_video(service)
+            for search in ['full_duplicate_database.csv', 'part_duplicate_database.csv', 'compress_duplicate_database.csv', 'one_event_duplicate_database.csv']:
+                check_database(service, search, search, queue_df)
+            if os.path.exists('dowloaded.csv') == True:
+                downloaded_df = pd.read_csv('dowloaded.csv', delimiter=',')
+                past_dowloaded_length = len(downloaded_df.index)
+                    
+                to_delete_df = downloaded_df.loc[~downloaded_df['id'].isin(queue_df['id'].tolist())] 
+                delete_from_sheets(SCOPES, to_delete_df)
+                
+                downloaded_df = downloaded_df.loc[downloaded_df['id'].isin(queue_df['id'].tolist())] 
+                queue_df = queue_df.loc[~queue_df['id'].isin(downloaded_df['id'].tolist())]
+                if len(downloaded_df.index) != past_dowloaded_length:
+                    existence_number = 1                
+                    while os.path.exists('Data'+ str(existence_number) +'.csv') == True:
+                        data_df = pd.read_csv("Data" + str(existence_number) + ".csv", delimiter=',')
+                        data_df = data_df.loc[data_df['Id'].isin(queue_df['id'].tolist())]
+                        data_df.to_csv('Data'+ str(existence_number) +'.csv', index=False, encoding='utf-8')
+                        existence_number = existence_number + 1
+                    downloaded_df.to_csv('dowloaded.csv', index=False, encoding='utf-8')
+                    upload_csv(service, 'dowloaded.csv')
+            
+            if len(queue_df.index) != 0:
+                print('Список не пуст')
+                queue_df.to_csv('queue.csv', index=False, encoding='utf-8')
+                upload_csv(service, 'queue.csv')
+            time.sleep(600)
+def analyze_full(file, start):
+    spreadsheet_id = copy_spreadsheet_id
+    SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    
+    credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    service = build('drive', 'v3', credentials=credentials)
+    
+    full_duplicate = pd.DataFrame(columns=['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate'])
+    part_duplicate = pd.DataFrame(columns=['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate','start','end', 'Similarity'])
+    compress_duplicate = pd.DataFrame(columns=['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate', 'Degree'])
+    one_event_duplicate = pd.DataFrame(columns=['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate','big_start','big_end', 'small_start','small_end', 'Similarity'])
+    
+    data_df = pd.read_csv(file, delimiter=',')
+    
+    for i in range(start, len(data_df.index) - 1):
+        New_hash_1 = data_df.iloc[i][12].split(',')
+        del New_hash_1[len(New_hash_1) - 1]
+        for j in range(i + 1, len(data_df.index)):
+            print(data_df.iloc[i][0],'сравниваю c',data_df.iloc[j][0])
+            print(i,'сравниваю c',j)
+            New_hash_2 = data_df.iloc[j][12].split(',')
+            del New_hash_2[len(New_hash_2) - 1]  
+            if data_df.iloc[i][7] == data_df.iloc[j][7] and data_df.iloc[i][9] == data_df.iloc[j][9]:    
+                flag = 0
+                for h in range(10):
+                    frame = int(round((len(New_hash_1) - 1) * h / 10))
+                    if (New_hash_1[frame] == New_hash_2[frame]):
+                        pass
+                    else:
+                        flag = 1
+                if flag == 0:
+                    full_duplicate.loc[len(full_duplicate)] = [data_df.iloc[i][0],data_df.iloc[i][1],data_df.iloc[i][2],data_df.iloc[i][3],data_df.iloc[i][4],data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6],data_df.iloc[i][7],data_df.iloc[i][8],data_df.iloc[i][9],data_df.iloc[i][10],data_df.iloc[i][11],\
+                                                                   data_df.iloc[j][0],data_df.iloc[j][1],data_df.iloc[j][2],data_df.iloc[j][3],data_df.iloc[j][4],data_df.iloc[j][5],\
+                                                               data_df.iloc[j][6],data_df.iloc[j][7],data_df.iloc[j][8],data_df.iloc[j][9],data_df.iloc[j][10],data_df.iloc[j][11]]
+            elif data_df.iloc[i][7] == data_df.iloc[j][7]:
+                flag = 0
+                for h in range(10):
+                    frame = int(round((len(New_hash_1) - 1) * h / 10))
+                    if (hashes_are_similar(New_hash_1[frame], New_hash_2[frame], 3)):
+                        pass
+                    else:
+                        flag = 1
+                if flag == 0:
+                    if data_df.iloc[i][9] > data_df.iloc[j][9]:
+                        compress_duplicate.loc[len(compress_duplicate)] = [data_df.iloc[i][0], data_df.iloc[i][1], data_df.iloc[i][2], data_df.iloc[i][3], data_df.iloc[i][4], data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6], data_df.iloc[i][7], data_df.iloc[i][8], data_df.iloc[i][9], data_df.iloc[i][10], data_df.iloc[i][11],\
+                                                                   data_df.iloc[j][0],data_df.iloc[j][1],data_df.iloc[j][2],data_df.iloc[j][3],data_df.iloc[j][4],data_df.iloc[j][5],\
+                                                               data_df.iloc[j][6],data_df.iloc[j][7],data_df.iloc[j][8],data_df.iloc[j][9],data_df.iloc[j][10],data_df.iloc[j][11],round(int(round(float(data_df.iloc[j][9])))/int(round(float(data_df.iloc[i][9])))*100, 3)]
+                        
+                    else:
+                        compress_duplicate.loc[len(compress_duplicate)] = [data_df.iloc[j][0],data_df.iloc[j][1],data_df.iloc[j][2],data_df.iloc[j][3],data_df.iloc[j][4],data_df.iloc[j][5],\
+                                                               data_df.iloc[j][6],data_df.iloc[j][7],data_df.iloc[j][8],data_df.iloc[j][9],data_df.iloc[j][10],data_df.iloc[j][11],\
+                                                                   data_df.iloc[i][0], data_df.iloc[i][1], data_df.iloc[i][2], data_df.iloc[i][3], data_df.iloc[i][4], data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6], data_df.iloc[i][7], data_df.iloc[i][8], data_df.iloc[i][9], data_df.iloc[i][10], data_df.iloc[i][11],round(int(round(float(data_df.iloc[i][9])))/int(round(float(data_df.iloc[j][9])))*100, 3)]
+            elif data_df.iloc[i][7] != data_df.iloc[j][7]:
+                big_is_first = False
+                if len(New_hash_1) > len(New_hash_2):
+                    big_one = New_hash_1
+                    small_one = New_hash_2
+                    big_is_first = True
+                else:
+                    small_one = New_hash_1
+                    big_one = New_hash_2
+        
+                big_count = 0
+                k = 0
+                while k < len(small_one):
+                    s = 0       
+                    while s < (len(big_one) - len(small_one)):
+ 
+                        if hashes_are_similar(big_one[s], small_one[k], 6):
+                            check_count = 3
+                            count = 3
+                            flag = 0
+                            plus = 3
+ 
+                            while flag == 0 and len(small_one) > (k + plus):
+                                if len(big_one) - (s+plus) > 3 and len(small_one) - (k+plus) > 3:
+                                    if hashes_are_similar(big_one[s+plus], small_one[k+plus], 6) and hashes_are_similar(big_one[s + plus + 1], small_one[k + plus + 1], 6) and hashes_are_similar(big_one[s + plus + 2], small_one[k + plus + 2], 6):
+                                        count = count + (6 - hash_distance(big_one[s + plus], small_one[k+plus]))/6 + (6 - hash_distance(big_one[s+plus + 1], small_one[k + plus + 1]))/6 + (6 - hash_distance(big_one[s + plus + 2], small_one[k + plus + 2]))/6
+                                        plus = plus + 3
+                                        check_count = check_count + 3
+                                    else: 
+                                        flag = 1
+                                else:
+                                    if hashes_are_similar(big_one[s+plus], small_one[k+plus], 6):        
+                                        count = count + (6 - hash_distance(big_one[s + plus], small_one[k+plus]))/2
+                                        check_count = check_count + 3
+                                        plus = plus + 3
+                                    else: 
+                                        flag = 1                                  
+                            if count > big_count:
+                                big_count = count 
+                                momentB = s
+                                momentS = k
+                            s = s + check_count
+                        else:
+                            s = s + 3
+                    k = k + 3
+                if big_count/len(small_one) >= part_percentage/100:
+                    if big_is_first == True:
+                        part_duplicate.loc[len(part_duplicate)] = [data_df.iloc[i][0], data_df.iloc[i][1], data_df.iloc[i][2], data_df.iloc[i][3], data_df.iloc[i][4], data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6], data_df.iloc[i][7], data_df.iloc[i][8], data_df.iloc[i][9], data_df.iloc[i][10], data_df.iloc[i][11],\
+                                                                   data_df.iloc[j][0],data_df.iloc[j][1],data_df.iloc[j][2],data_df.iloc[j][3],data_df.iloc[j][4],data_df.iloc[j][5],\
+                                                               data_df.iloc[j][6],data_df.iloc[j][7],data_df.iloc[j][8],data_df.iloc[j][9],data_df.iloc[j][10],data_df.iloc[j][11],\
+                                                                   round(float(data_df.iloc[i][3])*momentS/len(big_one), 3), round(float(data_df.iloc[i][3])*momentS/ len(big_one) + float(data_df.iloc[j][3]), 3), min(round(big_count/len(small_one), 3)*100, 100)]
+                    else:
+                        part_duplicate.loc[len(part_duplicate)] = [data_df.iloc[j][0],data_df.iloc[j][1],data_df.iloc[j][2],data_df.iloc[j][3],data_df.iloc[j][4],data_df.iloc[j][5],\
+                                                               data_df.iloc[j][6],data_df.iloc[j][7],data_df.iloc[j][8],data_df.iloc[j][9],data_df.iloc[j][10],data_df.iloc[j][11],\
+                                                                   data_df.iloc[i][0],data_df.iloc[i][1],data_df.iloc[i][2],data_df.iloc[i][3],data_df.iloc[i][4],data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6],data_df.iloc[i][7],data_df.iloc[i][8],data_df.iloc[i][9],data_df.iloc[i][10],data_df.iloc[i][11],\
+                                                                   round(float(data_df.iloc[j][3])*momentS/len(big_one), 3), round(float(data_df.iloc[j][3])*momentS/len(big_one) + float(data_df.iloc[i][3]), 3), min(round(big_count/len(small_one), 3)*100, 100)]
+                elif big_count/(len(small_one)*3) >= one_event_percentage/100:
+                    if big_is_first == True:
+                        one_event_duplicate.loc[len(one_event_duplicate)] = [data_df.iloc[i][0], data_df.iloc[i][1], data_df.iloc[i][2], data_df.iloc[i][3], data_df.iloc[i][4], data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6], data_df.iloc[i][7], data_df.iloc[i][8], data_df.iloc[i][9], data_df.iloc[i][10], data_df.iloc[i][11],\
+                                                                   data_df.iloc[j][0], data_df.iloc[j][1], data_df.iloc[j][2], data_df.iloc[j][3], data_df.iloc[j][4], data_df.iloc[j][5],\
+                                                               data_df.iloc[j][6], data_df.iloc[j][7], data_df.iloc[j][8], data_df.iloc[j][9], data_df.iloc[j][10], data_df.iloc[j][11],\
+                                                                   round(float(data_df.iloc[i][3])*momentB/len(big_one), 3), round(float(data_df.iloc[i][3])*momentB/ len(big_one) + big_count*float(data_df.iloc[i][3])/float(data_df.iloc[i][7]), 3),\
+                                                                   round(float(data_df.iloc[j][3])*momentS/len(small_one), 3), round(float(data_df.iloc[j][3])*momentS/ len(small_one) + big_count*float(data_df.iloc[j][3])/float(data_df.iloc[j][7]), 3), min(round(big_count/(len(small_one)*3), 3)*100, 100)]
+                    else:
+                        one_event_duplicate.loc[len(one_event_duplicate)] = [data_df.iloc[j][0],data_df.iloc[j][1],data_df.iloc[j][2],data_df.iloc[j][3],data_df.iloc[j][4],data_df.iloc[j][5],\
+                                                               data_df.iloc[j][6],data_df.iloc[j][7],data_df.iloc[j][8],data_df.iloc[j][9],data_df.iloc[j][10],data_df.iloc[j][11],\
+                                                                   data_df.iloc[i][0],data_df.iloc[i][1],data_df.iloc[i][2],data_df.iloc[i][3],data_df.iloc[i][4],data_df.iloc[i][5],\
+                                                               data_df.iloc[i][6],data_df.iloc[i][7],data_df.iloc[i][8],data_df.iloc[i][9],data_df.iloc[i][10],data_df.iloc[i][11],\
+                                                                   round(float(data_df.iloc[j][3])*momentB/len(big_one), 3), round(float(data_df.iloc[j][3])*momentB/len(big_one) + big_count*float(data_df.iloc[j][3])/float(data_df.iloc[j][7]), 3),\
+                                                                   round(float(data_df.iloc[i][3])*momentS/len(big_one), 3), round(float(data_df.iloc[i][3])*momentS/ len(big_one) + big_count*float(data_df.iloc[i][3])/float(data_df.iloc[i][7]), 3), min(round(big_count/(len(small_one)*3), 3)*100, 100)]
+    full_duplicate.to_csv('full_duplicate_database1.csv', index=False, encoding='utf-8')
+    part_duplicate.to_csv('part_duplicate_database1.csv', index=False, encoding='utf-8')
+    compress_duplicate.to_csv('compress_duplicate_database1.csv', index=False, encoding='utf-8')
+    one_event_duplicate.to_csv('one_event_duplicate_database1.csv', index=False, encoding='utf-8')
+
+    credentials = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
+    httpAuth = credentials.authorize(httplib2.Http())
+    service = apiclient.discovery.build('sheets','v4', http = httpAuth)
+    
+    body ={"valueInputOption": "USER_ENTERED",
+       "data":[]
+       }
+    
+    values = service.spreadsheets().values().get(spreadsheetId = spreadsheet_id, range = 'Полные!A:A',
+    majorDimension = 'COLUMNS').execute()
+    #pp.pprint(values)
+    try:
+        length = len(values['values'][0])
+    except:
+        length = 0
+    if length == 0:
+        body['data'].append({"range":'Полные!1:1',
+           "majorDimension": "ROWS",
+           "values":[['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate']]})
+        start = 2
+    else: 
+        start = length + 1
+    if len(full_duplicate.index) != 0:
+        for i in range(len(full_duplicate.index)):
+            body['data'].append({"range":'Полные!%d:%d' % (start + i, start + i),
+               "majorDimension": "ROWS",
+               "values":[[full_duplicate.iloc[i][0],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + full_duplicate.iloc[i][1] + '/view?usp=sharing', full_duplicate.iloc[i][1]),\
+                          '=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + full_duplicate.iloc[i][2] + '?usp=sharing', full_duplicate.iloc[i][2]),str(full_duplicate.iloc[i][3]),full_duplicate.iloc[i][4],\
+                              full_duplicate.iloc[i][5], str(full_duplicate.iloc[i][6]), str(full_duplicate.iloc[i][7]),str(full_duplicate.iloc[i][8]),str(full_duplicate.iloc[i][9]),str(full_duplicate.iloc[i][10]),str(full_duplicate.iloc[i][11]),full_duplicate.iloc[i][12],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + full_duplicate.iloc[i][13] + '/view?usp=sharing', full_duplicate.iloc[i][13]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + full_duplicate.iloc[i][14] + '?usp=sharing', full_duplicate.iloc[i][14]),str(full_duplicate.iloc[i][15]),full_duplicate.iloc[i][16], full_duplicate.iloc[i][17], str(full_duplicate.iloc[i][18]), str(full_duplicate.iloc[i][19]),str(full_duplicate.iloc[i][20]),str(full_duplicate.iloc[i][21]),str(full_duplicate.iloc[i][22]),str(full_duplicate.iloc[i][23])]]
+               })
+                
+    values = service.spreadsheets().values().get(spreadsheetId = spreadsheet_id, range = 'Сжатые!A:A',
+    majorDimension = 'COLUMNS').execute()            
+    try:
+        length = len(values['values'][0])
+    except:
+        length = 0
+    if length == 0:
+        body['data'].append({"range":'Сжатые!1:1',
+           "majorDimension": "ROWS",
+           "values":[['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate','Degree']]})
+        start = 2
+    else: 
+        start = length + 1
+    if len(compress_duplicate.index) != 0:
+        for i in range(len(compress_duplicate.index)):
+            body['data'].append({"range":'Сжатые!%d:%d' % (start + i, start + i),
+               "majorDimension": "ROWS",
+               "values":[[compress_duplicate.iloc[i][0],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + compress_duplicate.iloc[i][1] + '/view?usp=sharing', compress_duplicate.iloc[i][1]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + compress_duplicate.iloc[i][2] + '?usp=sharing', compress_duplicate.iloc[i][2]),str(compress_duplicate.iloc[i][3]),compress_duplicate.iloc[i][4], compress_duplicate.iloc[i][5], str(compress_duplicate.iloc[i][6]), str(compress_duplicate.iloc[i][7]),str(compress_duplicate.iloc[i][8]),str(compress_duplicate.iloc[i][9]),str(compress_duplicate.iloc[i][10]),str(compress_duplicate.iloc[i][11]),compress_duplicate.iloc[i][12],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + compress_duplicate.iloc[i][13] + '/view?usp=sharing', compress_duplicate.iloc[i][13]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + compress_duplicate.iloc[i][14] + '?usp=sharing', compress_duplicate.iloc[i][14]),str(compress_duplicate.iloc[i][15]),compress_duplicate.iloc[i][16], compress_duplicate.iloc[i][17], str(compress_duplicate.iloc[i][18]), str(compress_duplicate.iloc[i][19]),str(compress_duplicate.iloc[i][20]),str(compress_duplicate.iloc[i][21]),str(compress_duplicate.iloc[i][22]),str(compress_duplicate.iloc[i][23]), str(compress_duplicate.iloc[i][24])]]
+               })
+    
+    values = service.spreadsheets().values().get(spreadsheetId = spreadsheet_id, range = 'Частичные!A:A',
+    majorDimension = 'COLUMNS').execute()
+    try:
+        length = len(values['values'][0])
+    except:
+        length = 0
+    if length == 0:
+        body['data'].append({"range":'Частичные!1:1',
+           "majorDimension": "ROWS",
+           "values":[['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate','S time in big','E time in big', 'Similarity']]})
+        start = 2
+    else: 
+        start = length + 1
+    if len(part_duplicate.index) != 0:
+        for i in range(len(part_duplicate.index)):
+            body['data'].append({"range":'Частичные!%d:%d' % (start + i, start + i),
+               "majorDimension": "ROWS",
+               "values":[[part_duplicate.iloc[i][0],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + part_duplicate.iloc[i][1] + '/view?usp=sharing', part_duplicate.iloc[i][1]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + part_duplicate.iloc[i][2] + '?usp=sharing', part_duplicate.iloc[i][2]),str(part_duplicate.iloc[i][3]),part_duplicate.iloc[i][4], part_duplicate.iloc[i][5], str(part_duplicate.iloc[i][6]), str(part_duplicate.iloc[i][7]),str(part_duplicate.iloc[i][8]),str(part_duplicate.iloc[i][9]),str(part_duplicate.iloc[i][10]),str(part_duplicate.iloc[i][11]),part_duplicate.iloc[i][12],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + part_duplicate.iloc[i][13] + '/view?usp=sharing', part_duplicate.iloc[i][13]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + part_duplicate.iloc[i][14] + '?usp=sharing', part_duplicate.iloc[i][14]),str(part_duplicate.iloc[i][15]),part_duplicate.iloc[i][16], part_duplicate.iloc[i][17], str(part_duplicate.iloc[i][18]), str(part_duplicate.iloc[i][19]),str(part_duplicate.iloc[i][20]),str(part_duplicate.iloc[i][21]),str(part_duplicate.iloc[i][22]),str(part_duplicate.iloc[i][23]),str(part_duplicate.iloc[i][24]),str(part_duplicate.iloc[i][25]),str(part_duplicate.iloc[i][26])]]
+               })
+            
+    values = service.spreadsheets().values().get(spreadsheetId = spreadsheet_id, range = 'Одно событие!A:A',
+    majorDimension = 'COLUMNS').execute()
+    try:
+        length = len(values['values'][0])
+    except:
+        length = 0
+    if length == 0:
+        body['data'].append({"range":'Одно событие!1:1',
+           "majorDimension": "ROWS",
+           "values":[['Original','Id','Parent','Duration','Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate','Duplicate','D_Id','D_Parent','D_Duration','D_Codec', 'D_Resolution', 'D_FPS', 'D_FrameCount','D_Num Aud Chan','D_Size','D_Date','D_Bitrate','S time in big','E time in big','S time in small','E time in small', 'Similarity']]})
+        start = 2
+    else: 
+        start = length + 1
+    if len(one_event_duplicate.index) != 0:
+        for i in range(len(one_event_duplicate.index)):
+            body['data'].append({"range":'Одно событие!%d:%d' % (start + i, start + i),
+               "majorDimension": "ROWS",
+               "values":[[one_event_duplicate.iloc[i][0],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + one_event_duplicate.iloc[i][1] + '/view?usp=sharing', one_event_duplicate.iloc[i][1]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + one_event_duplicate.iloc[i][2] + '?usp=sharing', one_event_duplicate.iloc[i][2]),str(one_event_duplicate.iloc[i][3]),one_event_duplicate.iloc[i][4], one_event_duplicate.iloc[i][5], str(one_event_duplicate.iloc[i][6]), str(one_event_duplicate.iloc[i][7]),str(one_event_duplicate.iloc[i][8]),str(one_event_duplicate.iloc[i][9]),str(one_event_duplicate.iloc[i][10]),str(one_event_duplicate.iloc[i][11]),one_event_duplicate.iloc[i][12],'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/file/d/' + one_event_duplicate.iloc[i][13] + '/view?usp=sharing', one_event_duplicate.iloc[i][13]),'=ГИПЕРССЫЛКА("{}";"{}")'.format('https://drive.google.com/drive/folders/' + one_event_duplicate.iloc[i][14] + '?usp=sharing', one_event_duplicate.iloc[i][14]),str(one_event_duplicate.iloc[i][15]),one_event_duplicate.iloc[i][16], one_event_duplicate.iloc[i][17], str(one_event_duplicate.iloc[i][18]), str(one_event_duplicate.iloc[i][19]),str(one_event_duplicate.iloc[i][20]),str(one_event_duplicate.iloc[i][21]),str(one_event_duplicate.iloc[i][22]),str(one_event_duplicate.iloc[i][23]),str(one_event_duplicate.iloc[i][24]),str(one_event_duplicate.iloc[i][25]),str(one_event_duplicate.iloc[i][26]),str(one_event_duplicate.iloc[i][27]), str(one_event_duplicate.iloc[i][28])]]
+               })
+            
+    values = service.spreadsheets().values().batchUpdate(
+    spreadsheetId = spreadsheet_id, body = body).execute()  
+
+###############################################################################################################################
+if mod == 0:
+    while True:
+       	main()
+elif mod == 1:
+    analyze_full('Data1.csv')
