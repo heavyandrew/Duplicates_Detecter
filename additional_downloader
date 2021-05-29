@@ -1,0 +1,300 @@
+from google.oauth2 import service_account
+from googleapiclient.http import MediaIoBaseDownload,MediaFileUpload
+from googleapiclient.discovery import build
+import pprint
+import io
+import os
+import subprocess
+from PIL import Image
+import cv2
+import pandas as pd
+import shutil
+import csv
+import time
+from pydub.utils import mediainfo
+from moviepy.editor import VideoFileClip
+
+SERVICE_ACCOUNT_FILE = 'creds.json'
+parent = '13LqlEbymYzFRukjUQlzL7y_rCgdixfpu'
+
+step = 3
+
+def get_fps_frameCount(video_path):
+    cam = cv2.VideoCapture(video_path)
+    fps = cam.get(cv2.CAP_PROP_FPS)
+    frameCount = int(cam.get(cv2.CAP_PROP_FRAME_COUNT))
+    if frameCount == 0:
+        frameCount = count_frames_manual(cam)
+    fps = int(fps)
+    return fps, frameCount
+
+def count_frames_manual(video):
+    total = 0
+    while True:
+        (grabbed, frame) = video.read()
+        if not grabbed:
+            break
+        total += 1
+    return total
+
+def ahash(image_path, hash_size):
+    size=(hash_size,hash_size)
+    with open(image_path, 'rb') as f:
+        image = Image.open(f)
+        image = image.convert('L')
+        image = image.resize(size, Image.ANTIALIAS)
+
+    pixel = list(image.getdata())
+    avg = sum(pixel) / len(pixel)
+    bits = "".join(['1' if (px >= avg) else '0' for px in pixel])
+    hashformat = "0{hashlength}x".format(hashlength=hash_size ** 2 // 4)
+    return int(bits, 2).__format__(hashformat)
+
+def cut_video1(video_path, result_path):
+    sel = 'select=not(mod(n\,3))'
+    subprocess.call(['ffmpeg', '-i', video_path,
+                    '-vf', sel, '-vsync', 'vfr',
+                     result_path + 'pict%d.jpg'])
+
+
+def cut_video2(video_path, result_path):
+    subprocess.call(['ffmpeg', '-i', video_path,
+                    '-vsync', '0', '-an', '-frame_pts', '1',
+                     result_path + 'pict%d.jpg'])
+
+def ahash_table1(video_path,result_path,df, video_id, dl_time, parent):
+    df1 = pd.DataFrame(columns=['Video name','Id','Parent','Duration',
+                                'Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate', 'Hash', 'dl_time', 'tf_time'])
+    fps, frameCount = get_fps_frameCount(video_path)
+    name = video_path.rpartition('/')[2]
+    duration = subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                                '-of', 'default=noprint_wrappers=1:nokey=1', video_path])
+    duration = duration.decode('utf-8')
+    if duration == None or duration == 0:
+        duration = VideoFileClip(video_path).duration
+    codec = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                             'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1',
+                             video_path])
+    codec = codec.decode('utf-8')
+    resolution = subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries', 'stream=width,height',
+                                          '-of', 'csv=p=0:s=x', video_path])
+    resolution = resolution.decode('utf-8')
+    num_chan = subprocess.check_output(
+        ['ffprobe', '-i', video_path, '-show_entries', 'stream=channels', '-select_streams', 'a:0', '-of',
+         'compact=p=0:nk=1', '-v', '0'])
+    num_chan = num_chan.decode('utf-8')
+    try:
+        date = mediainfo(video_path)['TAG']['date']
+ 
+    except :
+        try:
+            date = mediainfo(video_path)['TAG']['creation_time']
+        except:
+            date = 0
+    else:
+        try:
+            date1 = mediainfo(video_path)['TAG']['creation_time']
+        except:
+            date = date
+        else:
+            if date1 > date:
+                date = date1
+ 
+    bit_rate = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                             'stream=bit_rate', '-of', 'default=noprint_wrappers=1:nokey=1',
+                             video_path])
+    bit_rate = bit_rate.decode('utf-8')
+    i = 0
+    count = 0
+    hash_size = 8;
+    image_path = result_path + 'pict' + str(i) + '.jpg'
+    df1.loc[count, 'Video name'] = name
+    df1.loc[count, 'Id'] = video_id.rstrip()    
+    df1.loc[count, 'FPS'] = fps
+    df1.loc[count, 'FrameCount'] = frameCount
+    df1.loc[count, 'Codec'] = codec.rstrip()
+    df1.loc[count, 'Duration'] = duration.rstrip()
+    df1.loc[count, 'Resolution'] = resolution.rstrip()
+    df1.loc[count, 'Date'] = date
+    df1.loc[count, 'Bitrate'] = bit_rate.rstrip()
+    df1.loc[count, 'dl_time'] = dl_time
+    parent = parent[2:len(parent) - 2]
+    df1.loc[count, 'Parent'] = parent
+ 
+    df1.loc[count, 'Size'] = os.path.getsize(video_path) // (1024)
+    df1.loc[count, 'Num Aud Chan'] = num_chan.rstrip()
+    string = ''
+    while i < frameCount:
+        try:
+            image_path = result_path + 'pict' + str(i) + '.jpg'
+            string = string  + ahash(image_path, hash_size) + ','
+            i = i + 1
+        except:
+            i = i+1
+    hash_list = string.split(',')
+    del hash_list[len(hash_list) - 1]
+    if len(hash_list)*3/frameCount >= 0.9:
+        df1.loc[count, 'Hash'] = string
+        df = df.append(df1)
+        
+    return df
+
+def hashes_are_similar(first_hash, second_hash, tolerance):
+    return hash_distance(first_hash,second_hash) <= tolerance
+
+def hash_distance(first_hash,second_hash):
+
+    return sum(map(lambda x: 0 if x[0] == x[1] else 1, zip(first_hash, second_hash)))
+
+
+def h_video(video_path, df, video_id, dl_time, parent):
+    if os.path.exists('res'):
+        shutil.rmtree('res', ignore_errors=False, onerror=None)
+    os.mkdir('res')
+    result = 'res/'
+
+    cut_video1(video_path,result)
+    df = ahash_table1(video_path, result, df, video_id, dl_time, parent)
+    shutil.rmtree('res', ignore_errors=False, onerror=None)
+    if len(df.index) != 0:
+        df.dropna(subset=['Hash'], inplace=True)   
+    return  df
+
+def download_file(file_id,path,file_name):
+    print(path)
+    request = service.files().get_media(fileId=file_id)
+    fh = io.FileIO(path, 'wb')
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while done is False:
+        status, done = downloader.next_chunk()
+        print ("Download %d%%." % int(status.progress() * 100))
+ 
+def find_csv(name):
+    results_data = service.files().list(pageSize=1000,
+                                   fields="nextPageToken, files(id, name, mimeType, parents)",q="name contains '%s' and mimeType contains 'csv' and '%s' in parents" % (name, parent)).execute()
+    
+    nextPageToken = results_data.get('nextPageToken')
+    
+    while (nextPageToken): 
+        nextPage = service.files().list(pageSize=1000,
+                                        fields="nextPageToken, files(id, name, mimeType, parents)",q="name contains '%s' and mimeType contains 'csv' and '%s' in parents" % (name, parent),
+                                        pageToken=nextPageToken).execute()
+        nextPageToken = nextPage.get('nextPageToken')
+        results_data['files'] = results_data['files'] + nextPage['files']
+    return results_data 
+
+def find_video():
+    results = service.files().list(pageSize=1000,
+                                       fields="nextPageToken, files(id, name, mimeType, parents)",q="mimeType contains 'video'").execute()       
+    nextPageToken = results.get('nextPageToken')
+            
+    while (nextPageToken):
+        nextPage = service.files().list(pageSize=1000,
+                                        fields="nextPageToken, files(id, name, mimeType, parents)",q="mimeType contains 'video'",
+                                        pageToken=nextPageToken).execute()
+        nextPageToken = nextPage.get('nextPageToken')
+        results['files'] = results['files'] + nextPage['files']
+    return results
+
+def find_exact_video(name, parent):
+    parent = parent[2:len(parent) - 2]
+    #print(parent)
+    results = service.files().list(pageSize=1000,
+                                       fields="nextPageToken, files(id, name, mimeType, parents)",q="name contains '%s' and mimeType contains 'video' and '%s' in parents" % (name, parent)).execute()       
+    nextPageToken = results.get('nextPageToken')
+            
+    while (nextPageToken):# and (len(results.get('files')) == 0):
+        nextPage = service.files().list(pageSize=1000,
+                                        fields="nextPageToken, files(id, name, mimeType, parents)",q="name contains '%s' and mimeType contains 'video' and '%s' in parents" % (name, parent),
+                                        pageToken=nextPageToken).execute()
+        nextPageToken = nextPage.get('nextPageToken')
+        results['files'] = results['files'] + nextPage['files']
+        #print(len(results['files']))
+    return results    
+
+def upload_csv(name_):
+    name = name_
+    file_metadata = {
+                    'name': name,
+                    'mimeType': 'text/csv',
+                    'parents': [parent]
+                }
+    media = MediaFileUpload(name_, mimetype = 'text/csv', resumable=True)
+    r = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+ 
+def delete_csv(data):
+    for i in range(len(data['files'])):
+        try:
+            service.files().delete(fileId=data.get('files')[i]['id']).execute() 
+        except:
+            pass 
+    
+###############################################################################################################################
+while True:
+    try:
+        SCOPES = ['https://www.googleapis.com/auth/drive']
+        credentials = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        service = build('drive', 'v3', credentials=credentials)       
+        queue_list = find_csv("queue") 
+        flag = False
+        while flag == False:
+            try:        
+                download_file(queue_list.get('files')[0]['id'],'queue.csv',queue_list.get('files')[0]['name']) 
+                queue_df = pd.read_csv('queue.csv', delimiter=',')
+                flag = True
+            except:
+                flag = False
+                queue_list = find_csv("queue")
+            
+        if os.path.exists('done.csv'): 
+            done_df = pd.read_csv('done.csv', delimiter=',')
+            queue_df = queue_df.loc[~queue_df['id'].isin(done_df['id'].tolist())]
+        if len(queue_df.index) > 50:
+            queue_df = queue_df[50:100]
+            for i in range(len(queue_df.index)):
+                if find_exact_video(queue_df.iloc[i][0], queue_df.iloc[i][2]):
+                        try:
+                            start = time.time()
+                            download_file(queue_df.iloc[i][1],queue_df.iloc[i][0],queue_df.iloc[i][0])
+                            dl_time = int(round(float('%s' % (time.time() - start))))
+                        
+                            minor_df = pd.DataFrame(columns=['Video name','Id','Parent','Duration',
+                                                'Codec', 'Resolution', 'FPS', 'FrameCount','Num Aud Chan','Size','Date','Bitrate', 'Hash', 'dl_time', 'tf_time'])
+                            if os.path.getsize(queue_df.iloc[i][0]) != 0:
+                                start = time.time()
+                                minor_df = h_video(queue_df.iloc[i][0], minor_df, queue_df.iloc[i][1], dl_time, queue_df.iloc[i][2])
+                                tf_time = int(round(float('%s' % (time.time() - start))))
+                                if os.path.exists(queue_df.iloc[i][0]): 
+                                    os.remove(queue_df.iloc[i][0]) 
+                                if len(minor_df.index) == 0: 
+                                    error = pd.DataFrame(columns = ['name','id','parents', 'status', 'dl_time', 'tf_time'])
+                                    error.loc[0] = [queue_df.iloc[i][0], queue_df.iloc[i][1], queue_df.iloc[i][2], 'Corrupted', dl_time, tf_time]
+                                    error.to_csv('little_error.csv', index=False, encoding='utf-8')          
+                                    upload_csv('little_error.csv')
+                                else:                                
+                                    minor_df.loc[(len(minor_df.index) - 1), 'tf_time'] = tf_time
+                                    minor_df.to_csv('minor_data.csv', index=False, encoding='utf-8')          
+                               
+                                    upload_csv('minor_data.csv')
+                            else: 
+                                deleted_df = pd.DataFrame(columns = ['name','id','parents', 'status', 'dl_time', 'tf_time'])
+                                deleted_df.loc[0] = [queue_df.iloc[i][0], queue_df.iloc[i][1], queue_df.iloc[i][2], 'Deleted', dl_time, 0]
+                                deleted_df.to_csv('little_deleted.csv', index=False, encoding='utf-8')          
+                           
+                                upload_csv('little_deleted.csv')
+                        except:
+                            flag = False 
+                            print('Файл', queue_df.iloc[0][0],'весит слишком много')
+                            if os.path.exists(queue_df.iloc[0][0]):
+                                os.remove(queue_df.iloc[0][0])
+                            continue
+            if os.path.exists('done.csv'): 
+                done_df = pd.read_csv('done.csv', delimiter=',')
+                done_df = pd.concat([done_df, queue_df], ignore_index = True)
+            else:
+                done_df = queue_df
+            done_df.to_csv('done.csv', index=False, encoding='utf-8')
+    except:
+        continue        
